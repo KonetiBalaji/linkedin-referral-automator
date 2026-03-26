@@ -5,7 +5,10 @@
 const LI_BASE = 'https://www.linkedin.com';
 const MAX_NOTE_LENGTH = 300;
 const BACKOFF_DELAYS = [30000, 60000, 120000, 300000]; // ms — cap 300s
-const FREE_NOTE_MONTHLY_CAP = 20; // LinkedIn's monthly cap on custom-note connects (free accounts)
+// Conservative starting cap; updated dynamically from API response bodies.
+// LinkedIn's actual limit varies by account type and has changed over time — do not treat
+// any hardcoded number here as ground truth.
+const FREE_NOTE_MONTHLY_CAP_DEFAULT = 5;
 // queryId rotates with LinkedIn frontend deploys. If search returns 400, inspect the Network
 // tab on a fresh LinkedIn search and copy the new queryId from the URL.
 const SEARCH_FALLBACK_QUERY_ID = 'voyagerSearchDashClusters.994bf4e7d2173b92ccdb5935710c3c5d';
@@ -23,13 +26,17 @@ const DEFAULT_CONFIG = {
     "I'd be happy to send over my resume and a brief intro. Really appreciate any help — thanks so much!",
   maxConnectionsPerRun: 15,
   maxMessagesPerRun: 15,
-  actionDelayMs: 4000,
+  actionDelayMs: 15000,      // 15 s default — more human-like pacing (was 4 s)
+  maxDailyConnections: 20,   // rolling 24-hour cap across all runs
+  maxDailyMessages: 50,
+  maxPendingBeforeSkip: 400, // skip Stage 3 if pending invite count reaches this; no claim about LinkedIn's internal limit
 };
 
 let popupPort = null;
 let consecutiveFailures = 0;
 let isRunning = false;
-let _halted = false; // set true on CAPTCHA/challenge detection — cleared on next run start
+let _halted = false;          // set true on CAPTCHA/challenge detection — cleared on next run start
+let _pendingInviteCount = null; // set by Stage 0, read by Stage 3
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -189,9 +196,87 @@ async function updateProfile(urn, updates) {
   await saveProfiles(profiles);
 }
 
+// ─── Pipeline checkpoint (resume after SW kill) ───────────────────────────────
+// RUN_ALL saves which stage it is about to execute. If Chrome kills the service
+// worker mid-run, the next RUN_ALL start resumes from that stage rather than
+// restarting from Stage 0. Cleared on successful run completion.
+
+async function saveCheckpoint(stage) {
+  await chrome.storage.local.set({ _checkpoint: { stage, savedAt: new Date().toISOString() } });
+}
+async function loadCheckpoint() {
+  const { _checkpoint } = await chrome.storage.local.get('_checkpoint');
+  return _checkpoint || null;
+}
+async function clearCheckpoint() {
+  await chrome.storage.local.remove('_checkpoint');
+}
+
+// ─── Daily action counter ─────────────────────────────────────────────────────
+// Tracks connects and messages sent today (YYYY-MM-DD). Resets at midnight.
+// Prevents multiple back-to-back runs from exceeding safe daily totals.
+
+async function getDailyActivity() {
+  const { dailyActivity } = await chrome.storage.local.get('dailyActivity');
+  const today = new Date().toISOString().slice(0, 10);
+  if (!dailyActivity || dailyActivity.date !== today) {
+    return { date: today, connects: 0, messages: 0 };
+  }
+  return dailyActivity;
+}
+
+async function incrementDailyActivity(type) {
+  const activity = await getDailyActivity();
+  activity[type] = (activity[type] || 0) + 1;
+  await chrome.storage.local.set({ dailyActivity: activity });
+  return activity;
+}
+
+// ─── Account warming ramp ─────────────────────────────────────────────────────
+// Caps connections per run based on days since first run. Useful for accounts
+// that are new to automation. Ramp: ≤7 days→5, ≤14 days→10, 15+→configured value.
+// firstRunDate is set once and never overwritten.
+
+async function getEffectiveConnectionCap(config) {
+  const { firstRunDate } = await chrome.storage.local.get('firstRunDate');
+  if (!firstRunDate) {
+    await chrome.storage.local.set({ firstRunDate: new Date().toISOString() });
+    log('Warming ramp: first run recorded — capping at 5 connects today');
+    return Math.min(config.maxConnectionsPerRun, 5);
+  }
+  const ageDays = Math.floor((Date.now() - new Date(firstRunDate).getTime()) / 86400000);
+  if (ageDays < 7)  { log(`Warming ramp: day ${ageDays} — cap 5`);  return Math.min(config.maxConnectionsPerRun, 5);  }
+  if (ageDays < 14) { log(`Warming ramp: day ${ageDays} — cap 10`); return Math.min(config.maxConnectionsPerRun, 10); }
+  return config.maxConnectionsPerRun;
+}
+
 // ─── Monthly note quota tracking ──────────────────────────────────────────────
-// LinkedIn caps free accounts to ~20 custom-note connection requests per calendar month.
-// We track usage in storage and fall back to note-free connects when exhausted.
+// LinkedIn caps custom-note connection requests per calendar month.
+// The actual limit varies by account type and has changed over time — we start
+// with a conservative default (FREE_NOTE_MONTHLY_CAP_DEFAULT) and update the
+// stored cap from API response bodies when they surface a quota number.
+
+async function getNoteCap() {
+  const { noteCapOverride } = await chrome.storage.local.get('noteCapOverride');
+  return noteCapOverride ?? FREE_NOTE_MONTHLY_CAP_DEFAULT;
+}
+
+// Call after a connect-with-note returns 400 — parses the error body for an
+// explicit monthly quota number and persists it if one is found.
+async function tryUpdateNoteCapFromError(responseData) {
+  if (!responseData) return;
+  const body = JSON.stringify(responseData);
+  const match = body.match(/monthly[^"]{0,40}?(\d+)/i)
+             || body.match(/quota[^"]{0,40}?(\d+)/i)
+             || body.match(/limit[^"]{0,40}?(\d+)/i);
+  if (match) {
+    const detected = parseInt(match[1], 10);
+    if (detected > 0 && detected <= 100) {
+      log(`Note quota detected from API: ${detected}/month — updating stored cap`);
+      await chrome.storage.local.set({ noteCapOverride: detected });
+    }
+  }
+}
 
 async function getMonthlyNoteState() {
   const { monthlyNotes } = await chrome.storage.local.get('monthlyNotes');
@@ -214,9 +299,9 @@ async function incrementMonthlyNoteCount() {
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-// ±25 % random jitter prevents detectable fixed-interval fingerprinting.
+// 50–150 % of actionDelayMs — wider window gives a more human-like timing distribution.
 async function withDelay(config) {
-  const jitter = config.actionDelayMs * (0.75 + Math.random() * 0.5);
+  const jitter = config.actionDelayMs * (0.5 + Math.random() * 1.0);
   await sleep(Math.round(jitter));
 }
 
@@ -360,6 +445,12 @@ async function stagePendingCleanup(config) {
   }
 
   const elements = r.data?.elements || r.data?.data?.elements || [];
+  _pendingInviteCount = elements.length;
+  log(`Stage 0: ${elements.length} pending invite(s) found`);
+  if (config.maxPendingBeforeSkip && elements.length >= config.maxPendingBeforeSkip) {
+    log(`Pending count (${elements.length}) ≥ maxPendingBeforeSkip (${config.maxPendingBeforeSkip}) — Stage 3 will be skipped this run`);
+  }
+
   const cutoffMs = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30 days ago
 
   let withdrawn = 0;
@@ -578,11 +669,15 @@ async function stageMessageExisting(config) {
     if (p.status !== 'discovered') continue;
     if (p.distance !== 'DISTANCE_1' && p.distance !== 1) continue;
 
+    const daily2 = await getDailyActivity();
+    if (daily2.messages >= config.maxDailyMessages) { log(`Daily message cap (${config.maxDailyMessages}) reached`); break; }
+
     try {
       const r = await sendMessageDash(urn, fillTemplate(config.referralMessage, p), myUrn);
       if (r.isChallenge) { haltOnChallenge(`message to ${p.name}`); break; }
       if (ok(r)) {
         await updateProfile(urn, { status: 'message_sent', message_sent_at: new Date().toISOString() });
+        await incrementDailyActivity('messages');
         log(`Messaged ${p.name} ✓`);
         sent++;
         resetFailures();
@@ -607,21 +702,38 @@ async function stageMessageExisting(config) {
 async function stageConnectNew(config) {
   if (_halted) { log('Stage 3: halted — skipping'); return; }
   log('Stage 3: Send connection requests — starting');
+
+  // Pending invite guard — skip stage if Stage 0 found count at or above threshold
+  if (_pendingInviteCount !== null && config.maxPendingBeforeSkip
+      && _pendingInviteCount >= config.maxPendingBeforeSkip) {
+    log(`Stage 3: skipped — ${_pendingInviteCount} pending invites ≥ maxPendingBeforeSkip (${config.maxPendingBeforeSkip})`);
+    return;
+  }
+
+  const effectiveCap = await getEffectiveConnectionCap(config);
+  if (effectiveCap < config.maxConnectionsPerRun) {
+    log(`Stage 3: warming ramp reduced cap to ${effectiveCap}`);
+  }
+
   const profiles = await getProfiles();
   let sent = 0;
   let noteQuotaLogShown = false;
 
   for (const [urn, p] of Object.entries(profiles)) {
     if (_halted) break;
-    if (sent >= config.maxConnectionsPerRun) { log('Max connections/run reached'); break; }
+    if (sent >= effectiveCap) { log('Max connections/run reached'); break; }
     if (p.status !== 'discovered') continue;
     if (p.distance === 'DISTANCE_1' || p.distance === 1) continue;
 
-    // Adaptive note strategy: check monthly quota; fall back to note-free when exhausted
+    const daily3 = await getDailyActivity();
+    if (daily3.connects >= config.maxDailyConnections) { log(`Daily connection cap (${config.maxDailyConnections}) reached`); break; }
+
+    // Adaptive note strategy: use dynamic cap; fall back to note-free when exhausted
     const noteState = await getMonthlyNoteState();
-    const useNote = noteState.sent < FREE_NOTE_MONTHLY_CAP;
+    const noteCap = await getNoteCap();
+    const useNote = noteState.sent < noteCap;
     if (!useNote && !noteQuotaLogShown) {
-      log(`Monthly note quota (${FREE_NOTE_MONTHLY_CAP}) reached — sending connects without note`);
+      log(`Monthly note quota (${noteCap}) reached — sending connects without note`);
       noteQuotaLogShown = true;
     }
 
@@ -639,6 +751,7 @@ async function stageConnectNew(config) {
       if (r.status === 201 || r.status === 200) {
         if (useNote) await incrementMonthlyNoteCount();
         await updateProfile(urn, { status: 'connection_sent', connection_sent_at: new Date().toISOString() });
+        await incrementDailyActivity('connects');
         log(`Connection sent to ${p.name} ✓${useNote ? '' : ' (no note)'} (${r.status})`);
         sent++;
         resetFailures();
@@ -651,6 +764,7 @@ async function stageConnectNew(config) {
         await handleFailure(`429 on connect to ${p.name}`);
       } else if (r.status === 400) {
         if (useNote) {
+          await tryUpdateNoteCapFromError(r.data); // learn actual quota from error body if present
           // 400 may indicate note was rejected (quota exceeded on LinkedIn's side) — retry without
           log(`Connect 400 for ${p.name} — retrying without note`);
           const rNoNote = await post(
@@ -660,6 +774,7 @@ async function stageConnectNew(config) {
           if (rNoNote.isChallenge) { haltOnChallenge(`connect retry to ${p.name}`); break; }
           if (rNoNote.status === 201 || rNoNote.status === 200) {
             await updateProfile(urn, { status: 'connection_sent', connection_sent_at: new Date().toISOString() });
+            await incrementDailyActivity('connects');
             log(`Connection sent to ${p.name} ✓ (no note, retry) (${rNoNote.status})`);
             sent++;
             resetFailures();
@@ -685,6 +800,43 @@ async function stageConnectNew(config) {
   sendStatusUpdate();
 }
 
+// ─── Reply detection ──────────────────────────────────────────────────────────
+// Returns true if the conversation with recipientUrn contains at least one message
+// sent by the other party (i.e. they replied to us). Fails open — returns false
+// on any error so a detection failure never silently blocks a follow-up.
+
+async function hasReply(recipientUrn, myUrn) {
+  try {
+    const cr = await get(
+      `/voyager/api/voyagerMessagingDashMessengerConversations` +
+      `?q=participants&recipients=List(${encodeURIComponent(recipientUrn)})` +
+      `&mailboxUrn=${encodeURIComponent(myUrn)}`
+    );
+    if (!ok(cr) || !cr.data) return false;
+
+    const elements = cr.data?.data?.elements || cr.data?.elements || [];
+    if (!elements.length) return false;
+
+    const convUrn = elements[0]?.entityUrn || elements[0]?.conversationUrn;
+    if (!convUrn) return false;
+
+    const mr = await get(
+      `/voyager/api/voyagerMessagingDashMessengerMessages` +
+      `?q=conversation&conversationUrn=${encodeURIComponent(convUrn)}&count=5`
+    );
+    if (!ok(mr) || !mr.data) return false;
+
+    const messages = mr.data?.data?.elements || mr.data?.elements || [];
+    const myId = myUrn.split(':').pop();
+    return messages.some(msg => {
+      const senderUrn = msg?.sender?.entityUrn || msg?.senderUrn || '';
+      return senderUrn && senderUrn.split(':').pop() !== myId;
+    });
+  } catch (_) {
+    return false; // fail open
+  }
+}
+
 // ─── Stage 4: Follow-up After Acceptance ─────────────────────────────────────
 
 async function stageFollowUp(config) {
@@ -700,12 +852,25 @@ async function stageFollowUp(config) {
     if (sent >= config.maxMessagesPerRun) { log('Max messages/run reached'); break; }
     if (p.status !== 'connection_sent') continue;
 
+    const daily4 = await getDailyActivity();
+    if (daily4.messages >= config.maxDailyMessages) { log(`Daily message cap (${config.maxDailyMessages}) reached`); break; }
+
     try {
+      // Skip follow-up if they already replied to a prior message
+      const replied = await hasReply(urn, myUrn);
+      if (replied) {
+        await updateProfile(urn, { status: 'replied', replied_at: new Date().toISOString() });
+        log(`${p.name} already replied — marking replied, skipping follow-up`);
+        await withDelay(config);
+        continue;
+      }
+
       const msgR = await sendMessageDash(urn, fillTemplate(config.referralMessage, p), myUrn);
       if (msgR.isChallenge) { haltOnChallenge(`follow-up to ${p.name}`); break; }
       log(`follow-up ${p.name} → ${msgR.status} | ${JSON.stringify(msgR.data || {}).slice(0, 150)}`);
       if (ok(msgR)) {
         await updateProfile(urn, { status: 'message_sent', message_sent_at: new Date().toISOString() });
+        await incrementDailyActivity('messages');
         log(`Follow-up sent to ${p.name} ✓`);
         sent++;
         resetFailures();
@@ -748,11 +913,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (msg.type === 'RUN_ALL') {
         log('=== Run All ===');
         try {
-          await stagePendingCleanup(config);
-          await stageDiscover(config);
-          await stageMessageExisting(config);
-          await stageConnectNew(config);
-          await stageFollowUp(config);
+          const ckpt = await loadCheckpoint();
+          const startStage = ckpt ? ckpt.stage : 0;
+          if (ckpt) log(`Resuming from checkpoint — starting at stage ${startStage} (saved ${ckpt.savedAt})`);
+
+          if (startStage <= 0) { await saveCheckpoint(0); await stagePendingCleanup(config); }
+          if (startStage <= 1) { await saveCheckpoint(1); await stageDiscover(config); }
+          if (startStage <= 2) { await saveCheckpoint(2); await stageMessageExisting(config); }
+          if (startStage <= 3) { await saveCheckpoint(3); await stageConnectNew(config); }
+          if (startStage <= 4) { await saveCheckpoint(4); await stageFollowUp(config); }
+          await clearCheckpoint();
         } finally { isRunning = false; }
         log('=== Run All complete ===');
       } else if (msg.type === 'RUN_DISCOVER') {
