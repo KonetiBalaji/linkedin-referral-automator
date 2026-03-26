@@ -170,7 +170,7 @@
     .limits-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
     .limit-item { display: flex; flex-direction: column; gap: 4px; }
     .limit-item label { margin: 0; }
-    input[type=number] {
+    input[type=number], input[type=text] {
       width: 100%;
       border: 1.5px solid #e0e0e0;
       border-radius: 8px;
@@ -179,7 +179,18 @@
       background: #fafafa;
       transition: border-color .15s;
     }
-    input[type=number]:focus { outline: none; border-color: #0073b1; background: #fff; }
+    input[type=number]:focus, input[type=text]:focus { outline: none; border-color: #0073b1; background: #fff; }
+    input[type=text].mono { font-size: 11px; font-family: 'Courier New', monospace; }
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 7px;
+      font-size: 11px;
+      font-weight: 500;
+      color: #555;
+      cursor: pointer;
+    }
 
     /* ── Buttons ── */
     .btn-run-row { margin-bottom: 10px; }
@@ -306,9 +317,10 @@
 <!-- Section 2: Templates -->
 <div class="section">
   <div class="section-header"><h2>Templates</h2></div>
-  <label>Connection note <span style="color:#bbb;font-weight:400;text-transform:none;letter-spacing:0">(max 300 chars)</span></label>
+  <label>Connection note <span id="note-limit-hint" style="color:#bbb;font-weight:400;text-transform:none;letter-spacing:0">(max 200 chars — free)</span></label>
   <textarea id="connection-note" rows="3"></textarea>
-  <div class="char-counter" id="note-counter">0 / 300</div>
+  <div class="char-counter" id="note-counter">0 / 200</div>
+  <label class="checkbox-row"><input type="checkbox" id="is-premium"> Premium / Sales Navigator account (allows 300-char notes)</label>
   <label style="margin-top:12px">Referral message</label>
   <textarea id="referral-message" rows="4"></textarea>
   <div class="placeholder-hint">
@@ -333,6 +345,8 @@
       <input type="number" id="action-delay" min="2000" max="30000" step="500" value="4000">
     </div>
   </div>
+  <label style="margin-top:10px">GraphQL Query ID <span style="color:#bbb;font-weight:400;text-transform:none;letter-spacing:0">(leave blank for built-in; paste new ID if search breaks)</span></label>
+  <input type="text" id="search-query-id" class="mono" placeholder="voyagerSearchDashClusters.abc123…">
 </div>
 
 <!-- Section 4: Control -->

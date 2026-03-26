@@ -14,6 +14,8 @@ const DEFAULT_CONFIG = {
   maxConnectionsPerRun: 15,
   maxMessagesPerRun: 15,
   actionDelayMs: 4000,
+  isPremium:     false,
+  searchQueryId: '',
 };
 
 let companies = [];
@@ -129,6 +131,8 @@ async function loadConfig() {
   document.getElementById('max-connections').value  = saved.maxConnectionsPerRun ?? DEFAULT_CONFIG.maxConnectionsPerRun;
   document.getElementById('max-messages').value     = saved.maxMessagesPerRun    ?? DEFAULT_CONFIG.maxMessagesPerRun;
   document.getElementById('action-delay').value     = saved.actionDelayMs        ?? DEFAULT_CONFIG.actionDelayMs;
+  document.getElementById('is-premium').checked     = saved.isPremium            ?? DEFAULT_CONFIG.isPremium;
+  document.getElementById('search-query-id').value  = saved.searchQueryId        ?? DEFAULT_CONFIG.searchQueryId;
 
   refreshCompanies();
   refreshRoles();
@@ -144,6 +148,8 @@ function saveConfig() {
     maxConnectionsPerRun: parseInt(document.getElementById('max-connections').value, 10) || 15,
     maxMessagesPerRun:    parseInt(document.getElementById('max-messages').value,    10) || 15,
     actionDelayMs:        parseInt(document.getElementById('action-delay').value,    10) || 4000,
+    isPremium:            document.getElementById('is-premium').checked,
+    searchQueryId:        document.getElementById('search-query-id').value.trim(),
   };
   chrome.storage.local.set({ config });
 }
@@ -151,11 +157,15 @@ function saveConfig() {
 // ─── Char counter ─────────────────────────────────────────────────────────────
 
 function updateNoteCounter() {
-  const ta = document.getElementById('connection-note');
+  const ta      = document.getElementById('connection-note');
   const counter = document.getElementById('note-counter');
-  const len = ta.value.length;
-  counter.textContent = `${len} / 300`;
-  counter.classList.toggle('over', len > 300);
+  const hint    = document.getElementById('note-limit-hint');
+  const premium = document.getElementById('is-premium').checked;
+  const limit   = premium ? 300 : 200;
+  const len     = ta.value.length;
+  counter.textContent = `${len} / ${limit}`;
+  counter.classList.toggle('over', len > limit);
+  if (hint) hint.textContent = premium ? '(max 300 chars — Premium)' : '(max 200 chars — free)';
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -174,6 +184,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('max-connections').addEventListener('change', saveConfig);
   document.getElementById('max-messages').addEventListener('change',    saveConfig);
   document.getElementById('action-delay').addEventListener('change',    saveConfig);
+  document.getElementById('is-premium').addEventListener('change',      () => { updateNoteCounter(); saveConfig(); });
+  document.getElementById('search-query-id').addEventListener('input',  saveConfig);
 
   function clearCaptchaAlert() {
     document.getElementById('captcha-alert').style.display = 'none';

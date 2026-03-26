@@ -3,7 +3,8 @@
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const LI_BASE = 'https://www.linkedin.com';
-const MAX_NOTE_LENGTH = 300;
+const NOTE_LENGTH_FREE    = 200; // LinkedIn reduced free-account note limit (Dec 2024)
+const NOTE_LENGTH_PREMIUM = 300; // Premium / Sales Navigator accounts
 const BACKOFF_DELAYS = [30000, 60000, 120000, 300000]; // ms — cap 300s
 // Conservative starting cap; updated dynamically from API response bodies.
 // LinkedIn's actual limit varies by account type and has changed over time — do not treat
@@ -11,6 +12,7 @@ const BACKOFF_DELAYS = [30000, 60000, 120000, 300000]; // ms — cap 300s
 const FREE_NOTE_MONTHLY_CAP_DEFAULT = 5;
 // queryId rotates with LinkedIn frontend deploys. If search returns 400, inspect the Network
 // tab on a fresh LinkedIn search and copy the new queryId from the URL.
+// Users can override this per-run via config.searchQueryId in the popup.
 const SEARCH_FALLBACK_QUERY_ID = 'voyagerSearchDashClusters.994bf4e7d2173b92ccdb5935710c3c5d';
 
 const DEFAULT_CONFIG = {
@@ -30,6 +32,8 @@ const DEFAULT_CONFIG = {
   maxDailyConnections: 20,   // rolling 24-hour cap across all runs
   maxDailyMessages: 50,
   maxPendingBeforeSkip: 400, // skip Stage 3 if pending invite count reaches this; no claim about LinkedIn's internal limit
+  isPremium:     false,      // true → 300-char notes (Premium/Sales Nav); false → 200-char (free account Dec 2024 limit)
+  searchQueryId: '',         // override GraphQL queryId; leave blank to use built-in SEARCH_FALLBACK_QUERY_ID
 };
 
 let popupPort = null;
@@ -91,10 +95,12 @@ async function apiCall(path, postBody = null, method = null) {
 
       try {
         const res = await fetch(`https://www.linkedin.com${path}`, init);
-        // Challenge detection: status 999 or redirect to /checkpoint/ or /challenge/
+        // Challenge detection: status 999, /checkpoint|/challenge/ redirects, or Arkose Labs captcha
         let isChallenge = res.status === 999
           || res.url.includes('/checkpoint/')
-          || res.url.includes('/challenge/');
+          || res.url.includes('/challenge/')
+          || res.url.includes('arkoselabs.com')
+          || res.url.includes('arcaptcha.co');
         let data = null;
         try {
           data = await res.json();
@@ -147,7 +153,9 @@ async function postText(path, body) {
         });
         let isChallenge = res.status === 999
           || res.url.includes('/checkpoint/')
-          || res.url.includes('/challenge/');
+          || res.url.includes('/challenge/')
+          || res.url.includes('arkoselabs.com')
+          || res.url.includes('arcaptcha.co');
         let data = null;
         try {
           data = await res.json();
@@ -435,26 +443,35 @@ async function stagePendingCleanup(config) {
   if (_halted) { log('Stage 0: halted — skipping'); return; }
   log('Stage 0: Pending invite cleanup — starting');
 
-  const r = await get(
-    '/voyager/api/relationships/sentInvitations?q=all&start=0&count=100&invitationType=CONNECTION'
-  );
-  if (r.isChallenge) { haltOnChallenge('pendingCleanup'); return; }
-  if (!ok(r) || !r.data) {
-    log(`Pending cleanup: could not fetch sent invitations (${r.status}) — skipping`);
-    return;
+  // Paginate through all sent invitations — LinkedIn returns ≤100 per page
+  const allElements = [];
+  let fetchStart = 0;
+  for (;;) {
+    const r = await get(
+      `/voyager/api/relationships/sentInvitations?q=all&start=${fetchStart}&count=100&invitationType=CONNECTION`
+    );
+    if (r.isChallenge) { haltOnChallenge('pendingCleanup'); return; }
+    if (!ok(r) || !r.data) {
+      if (fetchStart === 0) log(`Pending cleanup: could not fetch sent invitations (${r.status}) — skipping`);
+      break;
+    }
+    const page = r.data?.elements || r.data?.data?.elements || [];
+    allElements.push(...page);
+    if (page.length < 100) break; // last page reached
+    fetchStart += 100;
+    await withDelay(config);
   }
 
-  const elements = r.data?.elements || r.data?.data?.elements || [];
-  _pendingInviteCount = elements.length;
-  log(`Stage 0: ${elements.length} pending invite(s) found`);
-  if (config.maxPendingBeforeSkip && elements.length >= config.maxPendingBeforeSkip) {
-    log(`Pending count (${elements.length}) ≥ maxPendingBeforeSkip (${config.maxPendingBeforeSkip}) — Stage 3 will be skipped this run`);
+  _pendingInviteCount = allElements.length;
+  log(`Stage 0: ${allElements.length} pending invite(s) found`);
+  if (config.maxPendingBeforeSkip && allElements.length >= config.maxPendingBeforeSkip) {
+    log(`Pending count (${allElements.length}) ≥ maxPendingBeforeSkip (${config.maxPendingBeforeSkip}) — Stage 3 will be skipped this run`);
   }
 
   const cutoffMs = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30 days ago
 
   let withdrawn = 0;
-  for (const inv of elements) {
+  for (const inv of allElements) {
     if (_halted) break;
 
     // sentTime is epoch-ms in most Voyager responses; fall back to createdAt
@@ -514,7 +531,7 @@ async function resolveCompanyUrn(companyName) {
 
 // Primary search: /search/dash/clusters (confirmed working).
 // Falls back to GraphQL queryId endpoint if primary returns non-2xx or zero results.
-async function searchPeople(companyId, role, start = 0) {
+async function searchPeople(companyId, role, config, start = 0) {
   const keywords = encodeURIComponent(role);
   const r = await get(
     `/voyager/api/search/dash/clusters?q=all` +
@@ -526,7 +543,7 @@ async function searchPeople(companyId, role, start = 0) {
 
   if (!ok(r) || !r.data) {
     log(`dash/clusters [${role}@${companyId}] → ${r.status} — trying GraphQL fallback`);
-    return searchPeopleGraphQL(companyId, role, start);
+    return searchPeopleGraphQL(companyId, role, config, start);
   }
 
   const byUrn = {};
@@ -555,7 +572,7 @@ async function searchPeople(companyId, role, start = 0) {
   // Zero results on page 0 may indicate the endpoint shifted — try GraphQL fallback once
   if (people.length === 0 && start === 0) {
     log(`dash/clusters returned 0 results for [${role}@${companyId}] — trying GraphQL fallback`);
-    return searchPeopleGraphQL(companyId, role, start);
+    return searchPeopleGraphQL(companyId, role, config, start);
   }
 
   log(`dash/clusters [${role}@${companyId}] start=${start} → ${people.length} people`);
@@ -565,7 +582,7 @@ async function searchPeople(companyId, role, start = 0) {
 // Fallback search: /voyager/api/graphql with queryId.
 // SEARCH_FALLBACK_QUERY_ID rotates with LinkedIn deploys — if this 400s, inspect the Network
 // tab on a fresh LinkedIn search page for the current queryId.
-async function searchPeopleGraphQL(companyId, role, start = 0) {
+async function searchPeopleGraphQL(companyId, role, config, start = 0) {
   const variablesRaw =
     `(start:${start},count:20,origin:FACETED_SEARCH,` +
     `query:(flagshipSearchIntent:SEARCH_SRP,` +
@@ -576,7 +593,7 @@ async function searchPeopleGraphQL(companyId, role, start = 0) {
     `includeFiltersInResponse:false))`;
 
   const r = await get(
-    `/voyager/api/graphql?variables=${encodeURIComponent(variablesRaw)}&queryId=${SEARCH_FALLBACK_QUERY_ID}`
+    `/voyager/api/graphql?variables=${encodeURIComponent(variablesRaw)}&queryId=${config.searchQueryId || SEARCH_FALLBACK_QUERY_ID}`
   );
 
   if (r.isChallenge) { haltOnChallenge('searchPeopleGraphQL'); return []; }
@@ -626,7 +643,7 @@ async function stageDiscover(config) {
       let start = 0;
       for (let page = 0; page < 5; page++) {
         if (_halted) break;
-        const people = await searchPeople(companyId, role, start);
+        const people = await searchPeople(companyId, role, config, start);
         if (people.length === 0) break;
         for (const p of people) {
           if (!profiles[p.urn]) {
@@ -738,7 +755,7 @@ async function stageConnectNew(config) {
     }
 
     const body = { invitee: { inviteeUnion: { memberProfile: urn } } };
-    if (useNote) body.customMessage = fillTemplate(config.connectionNote, p).slice(0, MAX_NOTE_LENGTH);
+    if (useNote) body.customMessage = fillTemplate(config.connectionNote, p).slice(0, config.isPremium ? NOTE_LENGTH_PREMIUM : NOTE_LENGTH_FREE);
 
     try {
       const r = await post(
@@ -837,6 +854,27 @@ async function hasReply(recipientUrn, myUrn) {
   }
 }
 
+// Checks whether a profile is now DISTANCE_1 (connection accepted).
+// Returns true/false, or null if the check is inconclusive — callers should proceed as normal on null.
+async function checkIsConnected(publicId) {
+  if (!publicId) return null;
+  try {
+    const r = await get(
+      `/voyager/api/identity/profiles/${encodeURIComponent(publicId)}?projection=(memberRelationship)`
+    );
+    if (!ok(r) || !r.data) return null;
+    // memberDistance path varies across API versions — try the known locations
+    const dist = r.data?.data?.memberRelationship?.distance?.value
+      ?? r.data?.memberRelationship?.distance?.value
+      ?? r.data?.distance?.value
+      ?? null;
+    if (dist === null) return null;
+    return dist === 'DISTANCE_1' || dist === 1;
+  } catch (_) {
+    return null; // fail open — never block a follow-up due to a check error
+  }
+}
+
 // ─── Stage 4: Follow-up After Acceptance ─────────────────────────────────────
 
 async function stageFollowUp(config) {
@@ -856,6 +894,15 @@ async function stageFollowUp(config) {
     if (daily4.messages >= config.maxDailyMessages) { log(`Daily message cap (${config.maxDailyMessages}) reached`); break; }
 
     try {
+      // Pre-check: if we can confirm the invite hasn't been accepted yet, skip the message
+      // attempt entirely and save the API call. null = inconclusive, proceed as normal.
+      const connected = await checkIsConnected(p.public_id);
+      if (connected === false) {
+        log(`Follow-up ${p.name} — not yet connected, will retry next run`);
+        await withDelay(config);
+        continue;
+      }
+
       // Skip follow-up if they already replied to a prior message
       const replied = await hasReply(urn, myUrn);
       if (replied) {
