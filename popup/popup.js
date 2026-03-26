@@ -26,6 +26,10 @@ function connectPort() {
   port.onMessage.addListener(msg => {
     if (msg.type === 'LOG') appendLog(msg.message);
     if (msg.type === 'STATUS_UPDATE') updateCounts(msg.counts);
+    if (msg.type === 'CAPTCHA_DETECTED') {
+      document.getElementById('captcha-alert').style.display = 'block';
+      appendLog('CAPTCHA / challenge detected — solve it on linkedin.com then try again');
+    }
   });
   port.onDisconnect.addListener(() => {
     // SW killed — reconnect silently on next user action
@@ -171,21 +175,34 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('max-messages').addEventListener('change',    saveConfig);
   document.getElementById('action-delay').addEventListener('change',    saveConfig);
 
+  function clearCaptchaAlert() {
+    document.getElementById('captcha-alert').style.display = 'none';
+  }
+
   document.getElementById('btn-run-all').addEventListener('click', () => {
+    clearCaptchaAlert();
     chrome.runtime.sendMessage({ type: 'RUN_ALL' });
     appendLog('Run All triggered');
   });
   document.getElementById('btn-discover').addEventListener('click', () => {
+    clearCaptchaAlert();
     chrome.runtime.sendMessage({ type: 'RUN_DISCOVER' });
     appendLog('Discover triggered');
   });
   document.getElementById('btn-connect').addEventListener('click', () => {
+    clearCaptchaAlert();
     chrome.runtime.sendMessage({ type: 'RUN_CONNECT' });
     appendLog('Connect triggered');
   });
   document.getElementById('btn-followup').addEventListener('click', () => {
+    clearCaptchaAlert();
     chrome.runtime.sendMessage({ type: 'RUN_FOLLOWUP' });
     appendLog('Follow-up triggered');
+  });
+  document.getElementById('btn-cleanup').addEventListener('click', () => {
+    clearCaptchaAlert();
+    chrome.runtime.sendMessage({ type: 'RUN_CLEANUP' });
+    appendLog('Cleanup triggered');
   });
 document.getElementById('btn-clear').addEventListener('click', () => {
     if (confirm('Clear all discovered profile data? This cannot be undone.')) {

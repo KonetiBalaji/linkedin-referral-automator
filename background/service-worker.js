@@ -5,6 +5,10 @@
 const LI_BASE = 'https://www.linkedin.com';
 const MAX_NOTE_LENGTH = 300;
 const BACKOFF_DELAYS = [30000, 60000, 120000, 300000]; // ms — cap 300s
+const FREE_NOTE_MONTHLY_CAP = 20; // LinkedIn's monthly cap on custom-note connects (free accounts)
+// queryId rotates with LinkedIn frontend deploys. If search returns 400, inspect the Network
+// tab on a fresh LinkedIn search and copy the new queryId from the URL.
+const SEARCH_FALLBACK_QUERY_ID = 'voyagerSearchDashClusters.994bf4e7d2173b92ccdb5935710c3c5d';
 
 const DEFAULT_CONFIG = {
   companies: ['OpenAI', 'Anthropic', 'Google', 'Microsoft', 'Databricks'],
@@ -25,6 +29,7 @@ const DEFAULT_CONFIG = {
 let popupPort = null;
 let consecutiveFailures = 0;
 let isRunning = false;
+let _halted = false; // set true on CAPTCHA/challenge detection — cleared on next run start
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -46,14 +51,14 @@ async function getLinkedInTabId() {
 // ─── API calls via page context (MAIN world) ──────────────────────────────────
 // Service worker fetch() does NOT carry LinkedIn cookies (cross-origin extension context).
 // Injecting into the LinkedIn tab's MAIN world means live cookies are automatic.
-// Returns: { status: number, data: object|null }
+// Returns: { status: number, data: object|null, isChallenge: boolean }
 
-async function apiCall(path, postBody = null) {
+async function apiCall(path, postBody = null, method = null) {
   const tabId = await getLinkedInTabId();
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     world: 'MAIN',
-    func: async (path, postBody) => {
+    func: async (path, postBody, method) => {
       const csrfCookie = document.cookie.split(';')
         .map(c => c.trim())
         .find(c => c.startsWith('JSESSIONID='));
@@ -73,24 +78,38 @@ async function apiCall(path, postBody = null) {
         init.method = 'POST';
         init.headers['content-type'] = 'application/json';
         init.body = JSON.stringify(postBody);
+      } else if (method) {
+        init.method = method;
       }
 
       try {
         const res = await fetch(`https://www.linkedin.com${path}`, init);
+        // Challenge detection: status 999 or redirect to /checkpoint/ or /challenge/
+        let isChallenge = res.status === 999
+          || res.url.includes('/checkpoint/')
+          || res.url.includes('/challenge/');
         let data = null;
-        try { data = await res.json(); } catch (_) {}
-        return { status: res.status, data };
+        try {
+          data = await res.json();
+          if (!isChallenge && data) {
+            const s = JSON.stringify(data).toLowerCase();
+            if (s.includes('captcha') || (s.includes('"challenge"') && s.includes('"url"'))) {
+              isChallenge = true;
+            }
+          }
+        } catch (_) { /* non-JSON response — isChallenge already set from URL/status check */ }
+        return { status: res.status, data, isChallenge };
       } catch (e) {
-        return { status: 0, data: null, error: e.message };
+        return { status: 0, data: null, isChallenge: false, error: e.message };
       }
     },
-    args: [path, postBody],
+    args: [path, postBody, method],
   });
-  return results?.[0]?.result ?? { status: 0, data: null };
+  return results?.[0]?.result ?? { status: 0, data: null, isChallenge: false };
 }
 
 const ok   = r => r.status >= 200 && r.status < 300;
-const get  = path        => apiCall(path, null);
+const get  = path         => apiCall(path, null);
 const post = (path, body) => apiCall(path, body);
 
 // LinkedIn's new messaging endpoints require text/plain content-type (not application/json).
@@ -119,16 +138,27 @@ async function postText(path, body) {
           },
           body: JSON.stringify(body),
         });
+        let isChallenge = res.status === 999
+          || res.url.includes('/checkpoint/')
+          || res.url.includes('/challenge/');
         let data = null;
-        try { data = await res.json(); } catch (_) {}
-        return { status: res.status, data };
+        try {
+          data = await res.json();
+          if (!isChallenge && data) {
+            const s = JSON.stringify(data).toLowerCase();
+            if (s.includes('captcha') || (s.includes('"challenge"') && s.includes('"url"'))) {
+              isChallenge = true;
+            }
+          }
+        } catch (_) {}
+        return { status: res.status, data, isChallenge };
       } catch (e) {
-        return { status: 0, data: null, error: e.message };
+        return { status: 0, data: null, isChallenge: false, error: e.message };
       }
     },
     args: [path, body],
   });
-  return results?.[0]?.result ?? { status: 0, data: null };
+  return results?.[0]?.result ?? { status: 0, data: null, isChallenge: false };
 }
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
@@ -159,12 +189,35 @@ async function updateProfile(urn, updates) {
   await saveProfiles(profiles);
 }
 
+// ─── Monthly note quota tracking ──────────────────────────────────────────────
+// LinkedIn caps free accounts to ~20 custom-note connection requests per calendar month.
+// We track usage in storage and fall back to note-free connects when exhausted.
+
+async function getMonthlyNoteState() {
+  const { monthlyNotes } = await chrome.storage.local.get('monthlyNotes');
+  const now = new Date();
+  const thisMonth = `${now.getFullYear()}-${now.getMonth() + 1}`;
+  if (!monthlyNotes || monthlyNotes.month !== thisMonth) {
+    return { month: thisMonth, sent: 0 };
+  }
+  return monthlyNotes;
+}
+
+async function incrementMonthlyNoteCount() {
+  const state = await getMonthlyNoteState();
+  state.sent++;
+  await chrome.storage.local.set({ monthlyNotes: state });
+  return state.sent;
+}
+
 // ─── Delay & backoff ──────────────────────────────────────────────────────────
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+// ±25 % random jitter prevents detectable fixed-interval fingerprinting.
 async function withDelay(config) {
-  await sleep(config.actionDelayMs);
+  const jitter = config.actionDelayMs * (0.75 + Math.random() * 0.5);
+  await sleep(Math.round(jitter));
 }
 
 async function handleFailure(label) {
@@ -178,6 +231,16 @@ function resetFailures() {
   consecutiveFailures = 0;
 }
 
+// ─── Challenge / CAPTCHA detection ───────────────────────────────────────────
+
+function haltOnChallenge(context) {
+  _halted = true;
+  log(`CAPTCHA / challenge detected during ${context} — run halted. Solve the challenge on linkedin.com then try again.`);
+  if (popupPort) {
+    try { popupPort.postMessage({ type: 'CAPTCHA_DETECTED' }); } catch (_e) {}
+  }
+}
+
 // ─── My URN (sender identity) ─────────────────────────────────────────────────
 
 let _myUrn = null;
@@ -186,7 +249,6 @@ async function getMyUrn() {
   if (_myUrn) return _myUrn;
   const r = await get('/voyager/api/me');
   if (!ok(r) || !r.data) { log(`getMyUrn: /me returned ${r.status}`); return null; }
-  // Try normalized shape first, then included[]
   let urn = r.data?.data?.entityUrn || null;
   if (!urn) {
     for (const item of (r.data?.included || [])) {
@@ -196,7 +258,6 @@ async function getMyUrn() {
     }
   }
   if (urn && !urn.includes('fsd_profile')) {
-    // miniProfile URN → convert to fsd_profile (same base ID, different type prefix)
     urn = urn.replace(/urn:li:\w+:/, 'urn:li:fsd_profile:');
   }
   _myUrn = urn;
@@ -207,10 +268,9 @@ async function getMyUrn() {
 // ─── Messaging (new Dash endpoint) ────────────────────────────────────────────
 // Endpoint: POST /voyager/api/voyagerMessagingDashMessengerMessages?action=createMessage
 // Content-Type: text/plain;charset=UTF-8
-// Requires: mailboxUrn (our own fsd_profile URN) + conversationUrn (from lookup)
+// Requires: mailboxUrn (own fsd_profile URN) + conversationUrn (from lookup)
 
 async function getConversationUrn(recipientUrn, myUrn) {
-  // Find existing conversation with this person
   const r = await get(
     `/voyager/api/voyagerMessagingDashMessengerConversations` +
     `?q=participants&recipients=List(${encodeURIComponent(recipientUrn)})` +
@@ -218,13 +278,11 @@ async function getConversationUrn(recipientUrn, myUrn) {
   );
   if (!ok(r) || !r.data) return null;
 
-  // Try normalized shape: data.elements[]
   const elements = r.data?.data?.elements || r.data?.elements || [];
   if (elements.length > 0) {
     const urn = elements[0]?.entityUrn || elements[0]?.conversationUrn;
     if (urn) return urn;
   }
-  // Try included[]
   for (const item of (r.data?.included || [])) {
     const urn = item?.entityUrn || '';
     if (urn.includes('msg_conversation')) return urn;
@@ -233,12 +291,10 @@ async function getConversationUrn(recipientUrn, myUrn) {
 }
 
 async function sendMessageDash(recipientUrn, text, myUrn) {
-  // Step 1: look for an existing conversation
   let convUrn = await getConversationUrn(recipientUrn, myUrn);
   log(`sendMessageDash convUrn: ${convUrn}`);
 
   if (convUrn) {
-    // Existing conversation — send directly
     return postText('/voyager/api/voyagerMessagingDashMessengerMessages?action=createMessage', {
       dedupeByClientGeneratedToken: false,
       mailboxUrn: myUrn,
@@ -251,8 +307,7 @@ async function sendMessageDash(recipientUrn, text, myUrn) {
     });
   }
 
-  // Step 2: no existing conversation — createMessage with top-level recipients
-  // (LinkedIn auto-creates the conversation on first message)
+  // No existing conversation — LinkedIn auto-creates on first message
   const r = await postText('/voyager/api/voyagerMessagingDashMessengerMessages?action=createMessage', {
     dedupeByClientGeneratedToken: false,
     mailboxUrn: myUrn,
@@ -287,6 +342,58 @@ async function sendStatusUpdate() {
   }
 }
 
+// ─── Stage 0: Pending Invite Cleanup ──────────────────────────────────────────
+// Withdraw connection requests older than 30 days to stay well below the ~700 pending cap
+// and maintain a healthy acceptance rate (low rate triggers stricter weekly limits).
+
+async function stagePendingCleanup(config) {
+  if (_halted) { log('Stage 0: halted — skipping'); return; }
+  log('Stage 0: Pending invite cleanup — starting');
+
+  const r = await get(
+    '/voyager/api/relationships/sentInvitations?q=all&start=0&count=100&invitationType=CONNECTION'
+  );
+  if (r.isChallenge) { haltOnChallenge('pendingCleanup'); return; }
+  if (!ok(r) || !r.data) {
+    log(`Pending cleanup: could not fetch sent invitations (${r.status}) — skipping`);
+    return;
+  }
+
+  const elements = r.data?.elements || r.data?.data?.elements || [];
+  const cutoffMs = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30 days ago
+
+  let withdrawn = 0;
+  for (const inv of elements) {
+    if (_halted) break;
+
+    // sentTime is epoch-ms in most Voyager responses; fall back to createdAt
+    const sentAt = inv.sentTime ?? inv.createdAt ?? null;
+    if (!sentAt || sentAt > cutoffMs) continue;
+
+    // entityUrn shape: urn:li:fs_sentInvitation:12345  →  id = "12345"
+    const invId = inv.entityUrn?.split(':').pop();
+    if (!invId) continue;
+
+    const firstName = inv.toMember?.firstName || invId;
+    // Withdrawal: POST with ?action=withdraw (confirmed by linkedin-private-api)
+    const dr = await post(
+      `/voyager/api/relationships/invitations/${invId}?action=withdraw`,
+      {}
+    );
+    if (dr.isChallenge) { haltOnChallenge('invite withdrawal'); break; }
+    if (ok(dr)) {
+      withdrawn++;
+      log(`Withdrew stale invite to ${firstName} ✓`);
+    } else {
+      log(`Withdraw ${invId} failed (${dr.status}) — skipping`);
+    }
+    await withDelay(config);
+  }
+
+  log(`Stage 0 complete — ${withdrawn} stale invites withdrawn`);
+  sendStatusUpdate();
+}
+
 // ─── Stage 1: Discover ────────────────────────────────────────────────────────
 
 function companyNameToSlug(name) {
@@ -294,13 +401,12 @@ function companyNameToSlug(name) {
 }
 
 async function resolveCompanyUrn(companyName) {
-  // Primary: universalName lookup — reliable for well-known companies
   try {
     const slug = companyNameToSlug(companyName);
     const r = await get(`/voyager/api/organization/companies?q=universalName&universalName=${encodeURIComponent(slug)}`);
     log(`universalName "${slug}" → ${r.status}`);
+    if (r.isChallenge) { haltOnChallenge('resolveCompanyUrn'); return null; }
     if (ok(r) && r.data) {
-      // Response: data["*elements"][0] = "urn:li:fs_normalized_company:1441"
       const elements = r.data?.data?.['*elements'] || [];
       if (elements.length > 0) {
         const id = elements[0].split(':').pop();
@@ -311,30 +417,27 @@ async function resolveCompanyUrn(companyName) {
   } catch (e) {
     log(`universalName lookup error for "${companyName}": ${e.message}`);
   }
-
   log(`Could not resolve company ID for "${companyName}" — skipping`);
   return null;
 }
 
+// Primary search: /search/dash/clusters (confirmed working).
+// Falls back to GraphQL queryId endpoint if primary returns non-2xx or zero results.
 async function searchPeople(companyId, role, start = 0) {
-  // search/blended (404) and graphql queryId (400) are both dead.
-  // search/dash/clusters is the working endpoint (confirmed 200).
-  // query structure must NOT be encodeURIComponent'd — LinkedIn parses parens/colons as literals.
-  // Only the role keyword (which may contain spaces) needs encoding.
   const keywords = encodeURIComponent(role);
   const r = await get(
     `/voyager/api/search/dash/clusters?q=all` +
     `&query=(keywords:${keywords},flagshipSearchIntent:SEARCH_SRP,queryParameters:(currentCompany:List(${companyId}),resultType:List(PEOPLE)))` +
     `&start=${start}&count=20`
   );
-  if (!ok(r)) { log(`search [${role}@${companyId}] → ${r.status}`); return []; }
 
-  // Normalized response format — see REFERENCES.md §2b for full shape explanation.
-  //   data.elements[].items[].itemUnion["*entityResult"] = "urn:li:fsd_entityResultViewModel:(...)"
-  //   included[] contains EntityResultViewModel objects keyed by that URN
-  //   Profile URN is embedded inside the entityResultViewModel URN string
+  if (r.isChallenge) { haltOnChallenge('searchPeople'); return []; }
 
-  // Build lookup from entityUrn → included object
+  if (!ok(r) || !r.data) {
+    log(`dash/clusters [${role}@${companyId}] → ${r.status} — trying GraphQL fallback`);
+    return searchPeopleGraphQL(companyId, role, start);
+  }
+
   const byUrn = {};
   for (const item of (r.data?.included || [])) {
     if (item?.entityUrn) byUrn[item.entityUrn] = item;
@@ -345,42 +448,93 @@ async function searchPeople(companyId, role, start = 0) {
     for (const searchItem of (cluster?.items || [])) {
       const entityResultUrn = searchItem?.itemUnion?.['*entityResult'];
       if (!entityResultUrn) continue;
-
-      // Extract urn:li:fsd_profile:XYZ from within the entityResultViewModel URN
       const profileMatch = entityResultUrn.match(/(urn:li:fsd_profile:[^,)]+)/);
       if (!profileMatch) continue;
       const profileUrn = profileMatch[1];
-
-      // Resolve entity data from included
       const entity = byUrn[entityResultUrn];
       const name = entity?.title?.text;
       if (!name) continue;
-
       const distance = entity?.entityCustomTrackingInfo?.memberDistance ?? null;
       const navUrl = entity?.navigationUrl || '';
       const navMatch = navUrl.match(/\/in\/([^/?]+)/);
-
       people.push({ urn: profileUrn, name, distance, public_id: navMatch ? navMatch[1] : null });
     }
   }
 
-  log(`dash/clusters [${role}@${companyId}] → ${people.length} people`);
+  // Zero results on page 0 may indicate the endpoint shifted — try GraphQL fallback once
+  if (people.length === 0 && start === 0) {
+    log(`dash/clusters returned 0 results for [${role}@${companyId}] — trying GraphQL fallback`);
+    return searchPeopleGraphQL(companyId, role, start);
+  }
+
+  log(`dash/clusters [${role}@${companyId}] start=${start} → ${people.length} people`);
+  return people;
+}
+
+// Fallback search: /voyager/api/graphql with queryId.
+// SEARCH_FALLBACK_QUERY_ID rotates with LinkedIn deploys — if this 400s, inspect the Network
+// tab on a fresh LinkedIn search page for the current queryId.
+async function searchPeopleGraphQL(companyId, role, start = 0) {
+  const variablesRaw =
+    `(start:${start},count:20,origin:FACETED_SEARCH,` +
+    `query:(flagshipSearchIntent:SEARCH_SRP,` +
+    `queryParameters:List(` +
+    `(key:currentCompany,value:List(${companyId})),` +
+    `(key:resultType,value:List(PEOPLE)),` +
+    `(key:title,value:List(${role}))),` +
+    `includeFiltersInResponse:false))`;
+
+  const r = await get(
+    `/voyager/api/graphql?variables=${encodeURIComponent(variablesRaw)}&queryId=${SEARCH_FALLBACK_QUERY_ID}`
+  );
+
+  if (r.isChallenge) { haltOnChallenge('searchPeopleGraphQL'); return []; }
+  if (!ok(r) || !r.data) {
+    log(`GraphQL fallback [${role}@${companyId}] → ${r.status} — both search endpoints failed`);
+    return [];
+  }
+
+  // GraphQL response: data.searchDashClustersByAll.elements[].items[].item.entityResult
+  const clusters = r.data?.data?.searchDashClustersByAll?.elements || [];
+  const people = [];
+
+  for (const cluster of clusters) {
+    for (const hit of (cluster?.items || [])) {
+      const entity = hit?.item?.entityResult;
+      if (!entity) continue;
+      // Use targetUrn (stable profile URN) over trackingUrn (obfuscated, session-specific)
+      const profileUrn = entity.targetUrn || entity.trackingUrn;
+      if (!profileUrn || !profileUrn.includes('fsd_profile')) continue;
+      const name = entity.title?.text;
+      if (!name) continue;
+      const distance = entity.memberDistance?.value ?? null;
+      const navUrl = entity.navigationUrl || '';
+      const navMatch = navUrl.match(/\/in\/([^/?]+)/);
+      people.push({ urn: profileUrn, name, distance, public_id: navMatch ? navMatch[1] : null });
+    }
+  }
+
+  log(`GraphQL fallback [${role}@${companyId}] start=${start} → ${people.length} people`);
   return people;
 }
 
 async function stageDiscover(config) {
+  if (_halted) { log('Stage 1: halted — skipping'); return; }
   log('Stage 1: Discover — starting');
   const profiles = await getProfiles();
   let newCount = 0;
 
   for (const company of config.companies) {
+    if (_halted) break;
     const companyId = await resolveCompanyUrn(company);
     if (!companyId) continue;
     log(`"${company}" → ID ${companyId}`);
 
     for (const role of config.roles) {
+      if (_halted) break;
       let start = 0;
       for (let page = 0; page < 5; page++) {
+        if (_halted) break;
         const people = await searchPeople(companyId, role, start);
         if (people.length === 0) break;
         for (const p of people) {
@@ -411,6 +565,7 @@ async function stageDiscover(config) {
 // ─── Stage 2: Message Existing Connections (DISTANCE_1) ───────────────────────
 
 async function stageMessageExisting(config) {
+  if (_halted) { log('Stage 2: halted — skipping'); return; }
   log('Stage 2: Message existing connections — starting');
   const myUrn = await getMyUrn();
   if (!myUrn) { log('Stage 2: could not resolve own URN — aborting'); return; }
@@ -418,12 +573,14 @@ async function stageMessageExisting(config) {
   let sent = 0;
 
   for (const [urn, p] of Object.entries(profiles)) {
+    if (_halted) break;
     if (sent >= config.maxMessagesPerRun) { log('Max messages/run reached'); break; }
     if (p.status !== 'discovered') continue;
     if (p.distance !== 'DISTANCE_1' && p.distance !== 1) continue;
 
     try {
       const r = await sendMessageDash(urn, fillTemplate(config.referralMessage, p), myUrn);
+      if (r.isChallenge) { haltOnChallenge(`message to ${p.name}`); break; }
       if (ok(r)) {
         await updateProfile(urn, { status: 'message_sent', message_sent_at: new Date().toISOString() });
         log(`Messaged ${p.name} ✓`);
@@ -448,37 +605,72 @@ async function stageMessageExisting(config) {
 // ─── Stage 3: Send Connection Requests (DISTANCE_2/3) ────────────────────────
 
 async function stageConnectNew(config) {
+  if (_halted) { log('Stage 3: halted — skipping'); return; }
   log('Stage 3: Send connection requests — starting');
   const profiles = await getProfiles();
   let sent = 0;
+  let noteQuotaLogShown = false;
 
   for (const [urn, p] of Object.entries(profiles)) {
+    if (_halted) break;
     if (sent >= config.maxConnectionsPerRun) { log('Max connections/run reached'); break; }
     if (p.status !== 'discovered') continue;
     if (p.distance === 'DISTANCE_1' || p.distance === 1) continue;
 
-    const note = fillTemplate(config.connectionNote, p).slice(0, MAX_NOTE_LENGTH);
+    // Adaptive note strategy: check monthly quota; fall back to note-free when exhausted
+    const noteState = await getMonthlyNoteState();
+    const useNote = noteState.sent < FREE_NOTE_MONTHLY_CAP;
+    if (!useNote && !noteQuotaLogShown) {
+      log(`Monthly note quota (${FREE_NOTE_MONTHLY_CAP}) reached — sending connects without note`);
+      noteQuotaLogShown = true;
+    }
+
+    const body = { invitee: { inviteeUnion: { memberProfile: urn } } };
+    if (useNote) body.customMessage = fillTemplate(config.connectionNote, p).slice(0, MAX_NOTE_LENGTH);
+
     try {
       const r = await post(
         '/voyager/api/voyagerRelationshipsDashMemberRelationships?action=verifyQuotaAndCreateV2',
-        { invitee: { inviteeUnion: { memberProfile: urn } }, customMessage: note }
+        body
       );
 
+      if (r.isChallenge) { haltOnChallenge(`connect to ${p.name}`); break; }
+
       if (r.status === 201 || r.status === 200) {
+        if (useNote) await incrementMonthlyNoteCount();
         await updateProfile(urn, { status: 'connection_sent', connection_sent_at: new Date().toISOString() });
-        log(`Connection sent to ${p.name} ✓ (${r.status})`);
+        log(`Connection sent to ${p.name} ✓${useNote ? '' : ' (no note)'} (${r.status})`);
         sent++;
         resetFailures();
       } else if (r.status === 429) {
-        const body = JSON.stringify(r.data || {});
-        if (body.includes('WEEKLY_LIMIT') || body.includes('invitationsSentInLast7Days')) {
+        const body429 = JSON.stringify(r.data || {});
+        if (body429.includes('WEEKLY_LIMIT') || body429.includes('invitationsSentInLast7Days')) {
           log('Weekly connection limit hit — stopping');
           break;
         }
         await handleFailure(`429 on connect to ${p.name}`);
       } else if (r.status === 400) {
-        log(`${p.name} already connected or pending — skipping`);
-        await updateProfile(urn, { status: 'skipped' });
+        if (useNote) {
+          // 400 may indicate note was rejected (quota exceeded on LinkedIn's side) — retry without
+          log(`Connect 400 for ${p.name} — retrying without note`);
+          const rNoNote = await post(
+            '/voyager/api/voyagerRelationshipsDashMemberRelationships?action=verifyQuotaAndCreateV2',
+            { invitee: { inviteeUnion: { memberProfile: urn } } }
+          );
+          if (rNoNote.isChallenge) { haltOnChallenge(`connect retry to ${p.name}`); break; }
+          if (rNoNote.status === 201 || rNoNote.status === 200) {
+            await updateProfile(urn, { status: 'connection_sent', connection_sent_at: new Date().toISOString() });
+            log(`Connection sent to ${p.name} ✓ (no note, retry) (${rNoNote.status})`);
+            sent++;
+            resetFailures();
+          } else {
+            log(`${p.name} still failed without note (${rNoNote.status}) — skipping`);
+            await updateProfile(urn, { status: 'skipped' });
+          }
+        } else {
+          log(`${p.name} already connected or pending — skipping`);
+          await updateProfile(urn, { status: 'skipped' });
+        }
       } else {
         log(`Connect failed for ${p.name} — ${r.status} | ${JSON.stringify(r.data).slice(0, 200)}`);
         await handleFailure(`Connect to ${p.name}`);
@@ -496,6 +688,7 @@ async function stageConnectNew(config) {
 // ─── Stage 4: Follow-up After Acceptance ─────────────────────────────────────
 
 async function stageFollowUp(config) {
+  if (_halted) { log('Stage 4: halted — skipping'); return; }
   log('Stage 4: Follow-up on accepted connections — starting');
   const myUrn = await getMyUrn();
   if (!myUrn) { log('Stage 4: could not resolve own URN — aborting'); return; }
@@ -503,11 +696,13 @@ async function stageFollowUp(config) {
   let sent = 0;
 
   for (const [urn, p] of Object.entries(profiles)) {
+    if (_halted) break;
     if (sent >= config.maxMessagesPerRun) { log('Max messages/run reached'); break; }
     if (p.status !== 'connection_sent') continue;
 
     try {
       const msgR = await sendMessageDash(urn, fillTemplate(config.referralMessage, p), myUrn);
+      if (msgR.isChallenge) { haltOnChallenge(`follow-up to ${p.name}`); break; }
       log(`follow-up ${p.name} → ${msgR.status} | ${JSON.stringify(msgR.data || {}).slice(0, 150)}`);
       if (ok(msgR)) {
         await updateProfile(urn, { status: 'message_sent', message_sent_at: new Date().toISOString() });
@@ -544,15 +739,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
       const config = await getConfig();
-      // Guard against concurrent pipeline runs (duplicate message delivery in MV3)
-      const isPipelineMsg = ['RUN_ALL','RUN_DISCOVER','RUN_CONNECT','RUN_FOLLOWUP'].includes(msg.type);
+      const isPipelineMsg = ['RUN_ALL', 'RUN_DISCOVER', 'RUN_CONNECT', 'RUN_FOLLOWUP', 'RUN_CLEANUP'].includes(msg.type);
       if (isPipelineMsg) {
         if (isRunning) { log('Already running — ignoring duplicate request'); sendResponse({ ok: false }); return; }
         isRunning = true;
+        _halted = false; // clear any prior CAPTCHA halt on new run start
       }
       if (msg.type === 'RUN_ALL') {
         log('=== Run All ===');
         try {
+          await stagePendingCleanup(config);
           await stageDiscover(config);
           await stageMessageExisting(config);
           await stageConnectNew(config);
@@ -565,6 +761,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         try { await stageConnectNew(config); } finally { isRunning = false; }
       } else if (msg.type === 'RUN_FOLLOWUP') {
         try { await stageFollowUp(config); } finally { isRunning = false; }
+      } else if (msg.type === 'RUN_CLEANUP') {
+        try { await stagePendingCleanup(config); } finally { isRunning = false; }
       } else if (msg.type === 'CLEAR_PROFILES') {
         await chrome.storage.local.remove('profiles');
         log('All profile data cleared');
